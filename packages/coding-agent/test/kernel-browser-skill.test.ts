@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,8 +24,10 @@ class FakeChromeCdp {
 	readonly webSocketServer = new WebSocketServer({ noServer: true });
 	port = 0;
 	inputValue = "before";
+	clickCount = 0;
 	connectionCount = 0;
 	closeCount = 0;
+	newPageRequests = 0;
 
 	constructor() {
 		this.server = createServer((request, response) => {
@@ -45,15 +47,22 @@ class FakeChromeCdp {
 				return;
 			}
 			if (request.method === "PUT" && request.url?.startsWith("/json/new?")) {
+				this.newPageRequests += 1;
 				response.writeHead(200, { "content-type": "application/json" });
-				response.end(JSON.stringify({ ...targets[0], id: "page-new" }));
+				response.end(
+					JSON.stringify({
+						...targets[0],
+						id: "page-new",
+						webSocketDebuggerUrl: `ws://127.0.0.1:${this.port}/devtools/page/page-new`,
+					}),
+				);
 				return;
 			}
 			response.writeHead(404);
 			response.end();
 		});
 		this.server.on("upgrade", (request, socket, head) => {
-			if (request.url !== "/devtools/page/page-existing") {
+			if (request.url !== "/devtools/page/page-existing" && request.url !== "/devtools/page/page-new") {
 				socket.destroy();
 				return;
 			}
@@ -76,6 +85,44 @@ class FakeChromeCdp {
 				};
 				const expression = request.params?.expression ?? "";
 				if (expression === "hold") return;
+				if (expression === "drip") {
+					const timer = setInterval(() => {
+						if (socket.readyState !== socket.OPEN) return;
+						socket.send(JSON.stringify({ id: request.id + 1000, result: {} }));
+						socket.ping("drip");
+					}, 10);
+					socket.once("close", () => clearInterval(timer));
+					return;
+				}
+				if (expression === "forbidden-close") {
+					const rawSocket = (socket as unknown as { _socket: { write(data: Buffer): void } })._socket;
+					rawSocket.write(Buffer.from([0x88, 0x02, 0x03, 0xed]));
+					return;
+				}
+				if (expression === "oversize") {
+					socket.send("x".repeat(8 * 1024 * 1024 + 1));
+					return;
+				}
+				if (expression === "fragmented") {
+					const message = JSON.stringify({
+						id: request.id,
+						result: { result: { type: "string", value: "fragmented-ok" } },
+					});
+					const split = Math.floor(message.length / 2);
+					socket.send(message.slice(0, split), { fin: false });
+					socket.send(message.slice(split), { fin: true });
+					return;
+				}
+				if (expression === "ping") {
+					socket.once("pong", (payload) => {
+						if (payload.toString() !== "fixture-ping") return;
+						socket.send(
+							JSON.stringify({ id: request.id, result: { result: { type: "string", value: "pong-ok" } } }),
+						);
+					});
+					socket.ping("fixture-ping");
+					return;
+				}
 				if (expression === "disconnect") {
 					socket.close();
 					return;
@@ -98,6 +145,7 @@ class FakeChromeCdp {
 					this.inputValue = JSON.parse(match[1]!) as string;
 					value = previous;
 				}
+				if (expression.includes("element.click()")) this.clickCount += 1;
 				if (request.method === "Page.navigate") {
 					socket.send(JSON.stringify({ id: request.id, result: { frameId: "frame-1" } }));
 					return;
@@ -151,6 +199,16 @@ describe("browser skill over a fake loopback CDP endpoint", { tags: ["kernel-hea
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
+	it("ships no runtime PyPI dependency closure", () => {
+		const packagePath = join(getBundledSkillsDir(), "browser");
+		const pyproject = readFileSync(join(packagePath, "pyproject.toml"), "utf8");
+		const source = readFileSync(join(packagePath, "src", "browser", "__init__.py"), "utf8");
+		expect(pyproject).toContain("dependencies = []");
+		expect(pyproject).toContain('requires-python = ">=3.11"');
+		expect(source).not.toMatch(/^import (?:httpx|websockets)$/m);
+		expect(source).not.toMatch(/^from (?:httpx|websockets)/m);
+	});
+
 	it("discovers existing state, performs a reversible action, and closes only its client", async () => {
 		const manager = await provisioner!.ensure();
 		const result = await manager.execute(`
@@ -162,6 +220,7 @@ async with await browser.connect(endpoint) as chrome:
         observed = await page.read_text("#marker")
         previous = await page.fill("#name", "after")
         restored_from = await page.fill("#name", previous)
+        await page.click("#action")
         navigation = await page.navigate("https://example.test/next")
         page_closed_inside = page.closed
     page_closed_after = page.closed
@@ -196,6 +255,7 @@ print(json.dumps({
 			],
 		});
 		expect(chrome.inputValue).toBe("before");
+		expect(chrome.clickCount).toBe(1);
 		expect(chrome.connectionCount).toBe(1);
 		await expect.poll(() => chrome.closeCount).toBe(1);
 	});
@@ -248,12 +308,159 @@ async with await browser.connect(endpoint) as chrome:
         await page.evaluate("disconnect")
     except browser.BrowserConnectionError as error:
         print("disconnected", page.closed, str(error))
+    page = await chrome.page(target_id="page-existing")
+    page.browser._timeout = 0.05
+    try:
+        await page.evaluate("hold")
+    except browser.BrowserConnectionError as error:
+        print("timed-out", page.closed, str(error))
+    page = await chrome.page(target_id="page-existing")
+    try:
+        await page.evaluate("drip")
+    except browser.BrowserConnectionError as error:
+        print("drip-timed-out", page.closed, str(error))
+    page.browser._timeout = 5
+    page = await chrome.page(target_id="page-existing")
+    try:
+        await page.evaluate("oversize")
+    except browser.BrowserProtocolError as error:
+        print("oversized", page.closed, str(error))
+    page = await chrome.page(target_id="page-existing")
+    try:
+        await page.evaluate("forbidden-close")
+    except browser.BrowserProtocolError as error:
+        print("forbidden-close", page.closed, str(error))
 `);
 
 		expect(result.status).toBe("ok");
 		expect(result.stdout).toContain("cancelled True");
 		expect(result.stdout).toContain("disconnected True Chrome page disconnected during Runtime.evaluate");
-		expect(chrome.connectionCount).toBe(2);
-		await expect.poll(() => chrome.closeCount).toBe(2);
+		expect(result.stdout).toContain("timed-out True Chrome page disconnected during Runtime.evaluate");
+		expect(result.stdout).toContain("drip-timed-out True Chrome page disconnected during Runtime.evaluate");
+		expect(result.stdout).toContain("oversized True Chrome WebSocket frame exceeded the size limit");
+		expect(result.stdout).toContain("forbidden-close True Chrome sent a forbidden WebSocket close status code");
+		expect(chrome.connectionCount).toBe(6);
+		await expect.poll(() => chrome.closeCount).toBe(6);
+	});
+
+	it("handles fragmented messages and ping/pong without weakening the loopback page boundary", async () => {
+		const manager = await provisioner!.ensure();
+		const result = await manager.execute(`
+endpoint = "http://127.0.0.1:${chrome.port}"
+async with await browser.connect(endpoint, timeout=1) as chrome:
+    async with await chrome.page(target_id="page-existing") as page:
+        print(await page.evaluate("fragmented"))
+        print(await page.evaluate("ping"))
+target = browser.Target("wrong-page", "Wrong", "about:blank", "page", "ws://127.0.0.1:${chrome.port}/devtools/page/page-existing")
+try:
+    browser.Page(chrome, target)._validated_websocket_url()
+except Exception as error:
+    print(type(error).__name__, str(error))
+`);
+
+		expect(result.status).toBe("ok");
+		expect(result.stdout).toContain("fragmented-ok");
+		expect(result.stdout).toContain("pong-ok");
+		expect(result.stdout).toContain(
+			"BrowserConnectionError Chrome returned a non-loopback or malformed target WebSocket endpoint",
+		);
+	});
+
+	it("creates a tab only as an explicit action and leaves it open during cleanup", async () => {
+		const manager = await provisioner!.ensure();
+		const result = await manager.execute(`
+async with await browser.connect("http://127.0.0.1:${chrome.port}") as chrome:
+    async with await chrome.new_page("about:blank") as page:
+        print(page.target.target_id, page.closed)
+    print("disconnected", page.closed)
+`);
+
+		expect(result.status).toBe("ok");
+		expect(result.stdout).toContain("page-new False");
+		expect(result.stdout).toContain("disconnected True");
+		expect(chrome.newPageRequests).toBe(1);
+		expect(chrome.connectionCount).toBe(1);
+		await expect.poll(() => chrome.closeCount).toBe(1);
+	});
+
+	it("reads close-delimited HTTP bodies to EOF and caps aggregate chunked trailers", async () => {
+		const manager = await provisioner!.ensure();
+		const result = await manager.execute(`
+import json
+
+async def split_response(reader, writer):
+    await reader.readuntil(b"\\r\\n\\r\\n")
+    body = json.dumps([]).encode()
+    writer.write(b"HTTP/1.1 200 OK\\r\\nConnection: close\\r\\n\\r\\n" + body[:1])
+    await writer.drain()
+    await asyncio.sleep(0.02)
+    writer.write(body[1:])
+    await writer.drain()
+    writer.close()
+    await writer.wait_closed()
+
+server = await asyncio.start_server(split_response, "127.0.0.1", 0)
+port = server.sockets[0].getsockname()[1]
+async with server:
+    async with await browser.connect(f"http://127.0.0.1:{port}") as chrome:
+        print("split", await chrome.targets())
+
+async def excessive_trailers(reader, writer):
+    await reader.readuntil(b"\\r\\n\\r\\n")
+    writer.write(b"HTTP/1.1 200 OK\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n0\\r\\n" + b"X: y\\r\\n" * 11000 + b"\\r\\n")
+    await writer.drain()
+    writer.close()
+    await writer.wait_closed()
+
+server = await asyncio.start_server(excessive_trailers, "127.0.0.1", 0)
+port = server.sockets[0].getsockname()[1]
+async with server:
+    try:
+        await browser.connect(f"http://127.0.0.1:{port}")
+    except Exception as error:
+        print(type(error).__name__, str(error))
+
+async def oversized_chunk_line(reader, writer):
+    await reader.readuntil(b"\\r\\n\\r\\n")
+    writer.write(b"HTTP/1.1 200 OK\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n" + b"1" * 70000 + b"\\r\\n")
+    try:
+        await writer.drain()
+    except ConnectionError:
+        pass
+    writer.close()
+
+server = await asyncio.start_server(oversized_chunk_line, "127.0.0.1", 0)
+port = server.sockets[0].getsockname()[1]
+async with server:
+    try:
+        await browser.connect(f"http://127.0.0.1:{port}")
+    except Exception as error:
+        print("chunk-line", type(error).__name__, str(error))
+
+async def oversized_trailer_line(reader, writer):
+    await reader.readuntil(b"\\r\\n\\r\\n")
+    writer.write(b"HTTP/1.1 200 OK\\r\\nTransfer-Encoding: chunked\\r\\n\\r\\n0\\r\\nX: " + b"y" * 70000 + b"\\r\\n\\r\\n")
+    try:
+        await writer.drain()
+    except ConnectionError:
+        pass
+    writer.close()
+
+server = await asyncio.start_server(oversized_trailer_line, "127.0.0.1", 0)
+port = server.sockets[0].getsockname()[1]
+async with server:
+    try:
+        await browser.connect(f"http://127.0.0.1:{port}")
+    except Exception as error:
+        print("trailer-line", type(error).__name__, str(error))
+`);
+
+		expect(result.status).toBe("ok");
+		expect(result.stdout).toContain("split []");
+		expect(result.stdout).toContain("BrowserProtocolError Chrome returned malformed chunked HTTP trailers");
+		expect(result.stdout).toContain("chunk-line BrowserProtocolError Chrome returned malformed chunked HTTP data");
+		expect(result.stdout).toContain(
+			"trailer-line BrowserProtocolError Chrome returned malformed chunked HTTP trailers",
+		);
 	});
 });

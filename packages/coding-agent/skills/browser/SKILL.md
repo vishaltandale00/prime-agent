@@ -33,6 +33,9 @@ async with await browser.connect("http://127.0.0.1:9222") as chrome:
 
 Choose a target explicitly when more than one page is open. A unique
 `target_id`, `url_contains`, or `title_contains` selector is supported.
+`chrome.new_page(url)` is an explicit caller-owned browser action that creates
+a tab. Closing the returned page object disconnects from that tab but does not
+close it.
 
 Page operations use the same enclosing IPython cell authority:
 

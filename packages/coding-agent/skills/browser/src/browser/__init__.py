@@ -1,16 +1,22 @@
-"""In-process Chrome DevTools Protocol client for an existing browser."""
+"""Dependency-free CDP client for an already-running loopback Chrome."""
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
+import os
+import struct
 from dataclasses import asdict, dataclass
 from typing import Any
 from urllib.parse import quote, urlsplit
 
-import httpx
-from websockets.asyncio.client import ClientConnection, connect as websocket_connect
-from websockets.exceptions import ConnectionClosed
+_MAX_HEADERS = 64 * 1024
+_MAX_BODY = 8 * 1024 * 1024
+_MAX_FRAME = 8 * 1024 * 1024
+_MAX_MESSAGE = 8 * 1024 * 1024
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
 class BrowserError(RuntimeError):
@@ -44,7 +50,7 @@ def _endpoint_url(endpoint: str) -> str:
     try:
         parsed = urlsplit(endpoint)
         port = parsed.port
-    except ValueError as error:
+    except (AttributeError, ValueError) as error:
         raise ValueError("browser endpoint must be http://127.0.0.1:<port>") from error
     if (
         parsed.scheme != "http"
@@ -63,30 +69,281 @@ def _endpoint_url(endpoint: str) -> str:
 def _target_from_json(value: Any) -> Target:
     if not isinstance(value, dict):
         raise BrowserProtocolError("Chrome target discovery returned a non-object entry")
-    target_id = value.get("id")
-    title = value.get("title")
-    url = value.get("url")
-    target_type = value.get("type")
-    web_socket_url = value.get("webSocketDebuggerUrl")
+    target_id, title, url, target_type = (value.get(key) for key in ("id", "title", "url", "type"))
+    websocket_url = value.get("webSocketDebuggerUrl")
     if not all(isinstance(item, str) for item in (target_id, title, url, target_type)):
         raise BrowserProtocolError("Chrome target discovery returned an incomplete target")
-    if web_socket_url is not None and not isinstance(web_socket_url, str):
+    if websocket_url is not None and not isinstance(websocket_url, str):
         raise BrowserProtocolError("Chrome target discovery returned an invalid WebSocket endpoint")
-    return Target(
-        target_id=target_id,
-        title=title,
-        url=url,
-        target_type=target_type,
-        web_socket_debugger_url=web_socket_url,
-    )
+    return Target(target_id, title, url, target_type, websocket_url)
+
+
+async def _headers(reader: asyncio.StreamReader) -> tuple[str, dict[str, str]]:
+    try:
+        raw = await reader.readuntil(b"\r\n\r\n")
+    except asyncio.LimitOverrunError as error:
+        raise BrowserProtocolError("Chrome HTTP response headers exceeded the size limit") from error
+    except asyncio.IncompleteReadError as error:
+        raise BrowserConnectionError("Chrome closed the HTTP connection before responding") from error
+    if len(raw) > _MAX_HEADERS:
+        raise BrowserProtocolError("Chrome HTTP response headers exceeded the size limit")
+    lines = raw[:-4].decode("iso-8859-1").split("\r\n")
+    if not lines or not lines[0].startswith("HTTP/1."):
+        raise BrowserProtocolError("Chrome returned a malformed HTTP status line")
+    result: dict[str, str] = {}
+    for line in lines[1:]:
+        if ":" not in line:
+            raise BrowserProtocolError("Chrome returned a malformed HTTP response header")
+        name, value = line.split(":", 1)
+        name = name.strip().lower()
+        if not name or name in result:
+            raise BrowserProtocolError("Chrome returned duplicate or empty HTTP response headers")
+        result[name] = value.strip()
+    return lines[0], result
+
+
+async def _chunked(reader: asyncio.StreamReader) -> bytes:
+    body = bytearray()
+    while True:
+        try:
+            line = await reader.readline()
+        except ValueError as error:
+            raise BrowserProtocolError("Chrome returned malformed chunked HTTP data") from error
+        if len(line) > 128 or not line.endswith(b"\r\n"):
+            raise BrowserProtocolError("Chrome returned malformed chunked HTTP data")
+        try:
+            size = int(line[:-2].split(b";", 1)[0], 16)
+        except ValueError as error:
+            raise BrowserProtocolError("Chrome returned malformed chunked HTTP data") from error
+        if size < 0 or len(body) + size > _MAX_BODY:
+            raise BrowserProtocolError("Chrome HTTP response body exceeded the size limit")
+        if size == 0:
+            trailer_bytes = 0
+            while True:
+                try:
+                    trailer = await reader.readline()
+                except ValueError as error:
+                    raise BrowserProtocolError("Chrome returned malformed chunked HTTP trailers") from error
+                trailer_bytes += len(trailer)
+                if trailer == b"\r\n":
+                    return bytes(body)
+                if not trailer or len(trailer) > _MAX_HEADERS or trailer_bytes > _MAX_HEADERS:
+                    raise BrowserProtocolError("Chrome returned malformed chunked HTTP trailers")
+        try:
+            body.extend(await reader.readexactly(size))
+            if await reader.readexactly(2) != b"\r\n":
+                raise BrowserProtocolError("Chrome returned malformed chunked HTTP data")
+        except asyncio.IncompleteReadError as error:
+            raise BrowserConnectionError("Chrome closed the HTTP connection before responding") from error
+
+
+async def _body(reader: asyncio.StreamReader, headers: dict[str, str]) -> bytes:
+    encoding = headers.get("transfer-encoding", "").lower()
+    if encoding:
+        if encoding != "chunked":
+            raise BrowserProtocolError("Chrome returned an unsupported HTTP transfer encoding")
+        return await _chunked(reader)
+    raw_length = headers.get("content-length")
+    if raw_length is None:
+        result = bytearray()
+        while True:
+            chunk = await reader.read(min(64 * 1024, _MAX_BODY + 1 - len(result)))
+            if not chunk:
+                return bytes(result)
+            result.extend(chunk)
+            if len(result) > _MAX_BODY:
+                raise BrowserProtocolError("Chrome HTTP response body exceeded the size limit")
+    try:
+        length = int(raw_length)
+    except ValueError as error:
+        raise BrowserProtocolError("Chrome returned an invalid HTTP content length") from error
+    if length < 0 or length > _MAX_BODY:
+        raise BrowserProtocolError("Chrome HTTP response body exceeded the size limit")
+    try:
+        return await reader.readexactly(length)
+    except asyncio.IncompleteReadError as error:
+        raise BrowserConnectionError("Chrome closed the HTTP connection before responding") from error
+
+
+async def _close_writer(writer: asyncio.StreamWriter) -> None:
+    writer.close()
+    try:
+        async with asyncio.timeout(1):
+            await writer.wait_closed()
+    except (TimeoutError, ConnectionError, OSError):
+        pass
+
+
+class _WebSocket:
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, timeout: float):
+        self.reader = reader
+        self.writer = writer
+        self.timeout = timeout
+        self.write_lock = asyncio.Lock()
+        self.closed = False
+
+    @classmethod
+    async def connect(cls, url: str, timeout: float) -> _WebSocket:
+        parsed = urlsplit(url)
+        assert parsed.port is not None
+        writer: asyncio.StreamWriter | None = None
+        try:
+            async with asyncio.timeout(timeout):
+                reader, writer = await asyncio.open_connection("127.0.0.1", parsed.port, limit=_MAX_HEADERS)
+                key = base64.b64encode(os.urandom(16)).decode("ascii")
+                request = (
+                    f"GET {parsed.path} HTTP/1.1\r\nHost: 127.0.0.1:{parsed.port}\r\n"
+                    f"Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+                    "Sec-WebSocket-Version: 13\r\n\r\n"
+                ).encode("ascii")
+                writer.write(request)
+                await writer.drain()
+                status, headers = await _headers(reader)
+                expected = base64.b64encode(hashlib.sha1((key + _WS_GUID).encode()).digest()).decode()
+                connection = {item.strip().lower() for item in headers.get("connection", "").split(",")}
+                if (
+                    status.split(" ", 2)[1:2] != ["101"]
+                    or headers.get("upgrade", "").lower() != "websocket"
+                    or "upgrade" not in connection
+                    or headers.get("sec-websocket-accept") != expected
+                ):
+                    raise BrowserProtocolError("Chrome rejected or malformed the WebSocket upgrade")
+            return cls(reader, writer, timeout)
+        except asyncio.CancelledError:
+            if writer:
+                await asyncio.shield(_close_writer(writer))
+            raise
+        except (BrowserError, OSError, TimeoutError) as error:
+            if writer:
+                await _close_writer(writer)
+            if isinstance(error, BrowserError):
+                raise
+            raise BrowserConnectionError("could not open the Chrome WebSocket connection") from error
+
+    async def _write(self, opcode: int, payload: bytes) -> None:
+        if self.closed:
+            raise BrowserConnectionError("Chrome WebSocket connection is closed")
+        if len(payload) > _MAX_FRAME:
+            raise BrowserProtocolError("Chrome WebSocket frame exceeded the size limit")
+        length = len(payload)
+        if length < 126:
+            header = bytes((0x80 | opcode, 0x80 | length))
+        elif length <= 0xFFFF:
+            header = bytes((0x80 | opcode, 0x80 | 126)) + struct.pack("!H", length)
+        else:
+            header = bytes((0x80 | opcode, 0x80 | 127)) + struct.pack("!Q", length)
+        mask = os.urandom(4)
+        masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+        async with self.write_lock:
+            try:
+                async with asyncio.timeout(self.timeout):
+                    self.writer.write(header + mask + masked)
+                    await self.writer.drain()
+            except asyncio.CancelledError:
+                raise
+            except (ConnectionError, OSError, TimeoutError) as error:
+                raise BrowserConnectionError("Chrome WebSocket write failed") from error
+
+    async def send_text(self, value: str) -> None:
+        payload = value.encode()
+        if len(payload) > _MAX_MESSAGE:
+            raise BrowserProtocolError("Chrome WebSocket message exceeded the size limit")
+        await self._write(1, payload)
+
+    async def _read(self) -> tuple[bool, int, bytes]:
+        try:
+            async with asyncio.timeout(self.timeout):
+                first, second = await self.reader.readexactly(2)
+                final, opcode = bool(first & 0x80), first & 0x0F
+                if first & 0x70:
+                    raise BrowserProtocolError("Chrome WebSocket frame used unsupported extensions")
+                if second & 0x80:
+                    raise BrowserProtocolError("Chrome sent an invalid masked WebSocket frame")
+                length = second & 0x7F
+                if length == 126:
+                    length = struct.unpack("!H", await self.reader.readexactly(2))[0]
+                elif length == 127:
+                    encoded = await self.reader.readexactly(8)
+                    if encoded[0] & 0x80:
+                        raise BrowserProtocolError("Chrome sent an invalid WebSocket frame length")
+                    length = struct.unpack("!Q", encoded)[0]
+                if length > _MAX_FRAME:
+                    raise BrowserProtocolError("Chrome WebSocket frame exceeded the size limit")
+                if opcode >= 8 and (not final or length > 125):
+                    raise BrowserProtocolError("Chrome sent a malformed WebSocket control frame")
+                return final, opcode, await self.reader.readexactly(length)
+        except asyncio.CancelledError:
+            raise
+        except BrowserError:
+            raise
+        except asyncio.IncompleteReadError as error:
+            raise BrowserConnectionError("Chrome closed the WebSocket connection") from error
+        except (ConnectionError, OSError, TimeoutError) as error:
+            raise BrowserConnectionError("Chrome WebSocket read failed or timed out") from error
+
+    async def receive_text(self) -> str:
+        message, initial = bytearray(), None
+        while True:
+            final, opcode, payload = await self._read()
+            if opcode == 8:
+                if len(payload) == 1:
+                    raise BrowserProtocolError("Chrome sent a malformed WebSocket close frame")
+                if len(payload) >= 2:
+                    code = struct.unpack("!H", payload[:2])[0]
+                    if code < 1000 or code >= 5000 or code in {1004, 1005, 1006, 1015}:
+                        raise BrowserProtocolError("Chrome sent a forbidden WebSocket close status code")
+                    try:
+                        payload[2:].decode()
+                    except UnicodeDecodeError as error:
+                        raise BrowserProtocolError("Chrome sent a malformed WebSocket close reason") from error
+                try:
+                    await self._write(8, payload)
+                except BrowserError:
+                    pass
+                self.closed = True
+                await _close_writer(self.writer)
+                raise BrowserConnectionError("Chrome closed the WebSocket connection")
+            if opcode == 9:
+                await self._write(10, payload)
+                continue
+            if opcode == 10:
+                continue
+            if opcode in (1, 2):
+                if initial is not None:
+                    raise BrowserProtocolError("Chrome interleaved fragmented WebSocket messages")
+                initial = opcode
+            elif opcode == 0:
+                if initial is None:
+                    raise BrowserProtocolError("Chrome sent an unexpected WebSocket continuation")
+            else:
+                raise BrowserProtocolError("Chrome sent an unsupported WebSocket opcode")
+            message.extend(payload)
+            if len(message) > _MAX_MESSAGE:
+                raise BrowserProtocolError("Chrome WebSocket message exceeded the size limit")
+            if final:
+                if initial != 1:
+                    raise BrowserProtocolError("Chrome sent a non-text CDP WebSocket message")
+                try:
+                    return message.decode()
+                except UnicodeDecodeError as error:
+                    raise BrowserProtocolError("Chrome sent a non-UTF-8 CDP WebSocket message") from error
+
+    async def close(self) -> None:
+        if self.closed:
+            return
+        try:
+            await self._write(8, struct.pack("!H", 1000))
+        except BrowserError:
+            pass
+        self.closed = True
+        await _close_writer(self.writer)
 
 
 class Browser:
     """HTTP discovery client for one already-running Chrome instance."""
 
-    def __init__(self, endpoint: str, client: httpx.AsyncClient):
-        self.endpoint = endpoint
-        self._client = client
+    def __init__(self, endpoint: str, timeout: float):
+        self.endpoint, self._timeout = endpoint, timeout
         self._pages: set[Page] = set()
         self._closed = False
 
@@ -107,16 +364,35 @@ class Browser:
 
     async def _request_json(self, method: str, path: str) -> Any:
         self._ensure_open()
+        port = urlsplit(self.endpoint).port
+        writer: asyncio.StreamWriter | None = None
         try:
-            response = await self._client.request(method, path)
-            response.raise_for_status()
-            return response.json()
+            async with asyncio.timeout(self._timeout):
+                reader, writer = await asyncio.open_connection("127.0.0.1", port, limit=_MAX_HEADERS)
+                writer.write(
+                    f"{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: application/json\r\nConnection: close\r\n\r\n".encode()
+                )
+                await writer.drain()
+                status, headers = await _headers(reader)
+                response = await _body(reader, headers)
+            parts = status.split(" ", 2)
+            if len(parts) < 2 or not parts[1].isdigit() or not 200 <= int(parts[1]) < 300:
+                raise BrowserConnectionError(f"Chrome CDP endpoint returned HTTP {parts[1] if len(parts) > 1 else 'error'}")
+            try:
+                return json.loads(response.decode())
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise BrowserProtocolError("Chrome CDP endpoint returned invalid JSON") from error
         except asyncio.CancelledError:
             raise
-        except (httpx.HTTPError, ValueError) as error:
+        except BrowserError:
+            raise
+        except (OSError, TimeoutError) as error:
             raise BrowserConnectionError(
                 f"Chrome CDP endpoint {self.endpoint} did not return a valid response for {path}"
             ) from error
+        finally:
+            if writer:
+                await asyncio.shield(_close_writer(writer))
 
     async def targets(self) -> list[dict[str, Any]]:
         """Return discoverable targets without opening a target WebSocket."""
@@ -125,16 +401,9 @@ class Browser:
             raise BrowserProtocolError("Chrome target discovery did not return a list")
         return [asdict(_target_from_json(item)) for item in discovered]
 
-    async def page(
-        self,
-        *,
-        target_id: str | None = None,
-        url_contains: str | None = None,
-        title_contains: str | None = None,
-    ) -> Page:
+    async def page(self, *, target_id: str | None = None, url_contains: str | None = None, title_contains: str | None = None) -> Page:
         """Open one unique page target selected from the existing Chrome state."""
-        selectors = [target_id is not None, url_contains is not None, title_contains is not None]
-        if sum(selectors) > 1:
+        if sum(value is not None for value in (target_id, url_contains, title_contains)) > 1:
             raise ValueError("choose only one of target_id, url_contains, or title_contains")
         targets = [_target_from_json(item) for item in await self._request_json("GET", "/json/list")]
         pages = [target for target in targets if target.target_type == "page"]
@@ -172,24 +441,21 @@ class Browser:
         return page
 
     async def close(self) -> None:
-        """Close only skill-owned client connections, never Chrome or its tabs."""
+        """Close only skill-owned connections, never Chrome or its tabs."""
         if self._closed:
             return
         self._closed = True
-        pages = list(self._pages)
-        self._pages.clear()
+        pages, self._pages = list(self._pages), set()
         if pages:
             await asyncio.gather(*(page.close() for page in pages), return_exceptions=True)
-        await self._client.aclose()
 
 
 class Page:
     """One direct WebSocket connection to an existing Chrome page target."""
 
     def __init__(self, browser: Browser, target: Target):
-        self.browser = browser
-        self.target = target
-        self._socket: ClientConnection | None = None
+        self.browser, self.target = browser, target
+        self._socket: _WebSocket | None = None
         self._command_lock = asyncio.Lock()
         self._next_command_id = 1
         self._closed = False
@@ -210,15 +476,14 @@ class Page:
         value = self.target.web_socket_debugger_url
         if value is None:
             raise BrowserTargetError(f"page target {self.target.target_id!r} has no WebSocket endpoint")
-        parsed = urlsplit(value)
-        endpoint = urlsplit(self.browser.endpoint)
+        parsed, endpoint = urlsplit(value), urlsplit(self.browser.endpoint)
         if (
             parsed.scheme != "ws"
             or parsed.hostname != "127.0.0.1"
             or parsed.port != endpoint.port
             or parsed.username is not None
             or parsed.password is not None
-            or not parsed.path.startswith("/devtools/page/")
+            or parsed.path != f"/devtools/page/{self.target.target_id}"
             or parsed.query
             or parsed.fragment
         ):
@@ -227,12 +492,7 @@ class Page:
 
     async def _open(self) -> None:
         try:
-            self._socket = await websocket_connect(
-                self._validated_websocket_url(),
-                open_timeout=5,
-                close_timeout=1,
-                max_size=8 * 1024 * 1024,
-            )
+            self._socket = await _WebSocket.connect(self._validated_websocket_url(), self.browser._timeout)
         except asyncio.CancelledError:
             await self.close()
             raise
@@ -247,27 +507,35 @@ class Page:
             command_id = self._next_command_id
             self._next_command_id += 1
             try:
-                await self._socket.send(json.dumps({"id": command_id, "method": method, "params": params or {}}))
-                while True:
-                    message = json.loads(await self._socket.recv())
-                    if not isinstance(message, dict) or message.get("id") != command_id:
-                        continue
-                    error = message.get("error")
-                    if isinstance(error, dict):
-                        detail = error.get("message")
-                        raise BrowserProtocolError(
-                            f"Chrome CDP command {method} failed: {detail if isinstance(detail, str) else 'unknown error'}"
-                        )
-                    result = message.get("result")
-                    if not isinstance(result, dict):
-                        raise BrowserProtocolError(f"Chrome CDP command {method} returned no result")
-                    return result
+                async with asyncio.timeout(self.browser._timeout):
+                    await self._socket.send_text(json.dumps({"id": command_id, "method": method, "params": params or {}}))
+                    while True:
+                        message = json.loads(await self._socket.receive_text())
+                        if not isinstance(message, dict) or message.get("id") != command_id:
+                            continue
+                        error = message.get("error")
+                        if isinstance(error, dict):
+                            detail = error.get("message")
+                            raise BrowserProtocolError(
+                                f"Chrome CDP command {method} failed: {detail if isinstance(detail, str) else 'unknown error'}"
+                            )
+                        result = message.get("result")
+                        if not isinstance(result, dict):
+                            raise BrowserProtocolError(f"Chrome CDP command {method} returned no result")
+                        return result
             except asyncio.CancelledError:
                 await asyncio.shield(self.close())
                 raise
-            except BrowserError:
+            except BrowserProtocolError:
+                await self.close()
                 raise
-            except (ConnectionClosed, OSError, ValueError, TypeError) as error:
+            except BrowserConnectionError as error:
+                await self.close()
+                raise BrowserConnectionError(f"Chrome page disconnected during {method}") from error
+            except TimeoutError as error:
+                await self.close()
+                raise BrowserConnectionError(f"Chrome page disconnected during {method}") from error
+            except (ValueError, TypeError) as error:
                 await self.close()
                 raise BrowserConnectionError(f"Chrome page disconnected during {method}") from error
 
@@ -275,15 +543,9 @@ class Page:
         """Evaluate JavaScript in the page and return its JSON-serializable value."""
         if not isinstance(expression, str) or not expression.strip():
             raise ValueError("expression must be a non-empty string")
-        response = await self._command(
-            "Runtime.evaluate",
-            {
-                "expression": expression,
-                "awaitPromise": await_promise,
-                "returnByValue": True,
-                "userGesture": True,
-            },
-        )
+        response = await self._command("Runtime.evaluate", {
+            "expression": expression, "awaitPromise": await_promise, "returnByValue": True, "userGesture": True,
+        })
         if "exceptionDetails" in response:
             details = response["exceptionDetails"]
             text = details.get("text") if isinstance(details, dict) else None
@@ -291,41 +553,34 @@ class Page:
         result = response.get("result")
         if not isinstance(result, dict):
             raise BrowserProtocolError("page evaluation returned no remote object")
-        if "value" in result:
-            return result["value"]
-        if "unserializableValue" in result:
-            return result["unserializableValue"]
-        return None
+        return result.get("value", result.get("unserializableValue"))
 
     async def read_text(self, selector: str = "body") -> str:
         """Read visible text, or text content when visible text is unavailable."""
         _validate_selector(selector)
-        expression = f"""(() => {{
+        value = await self.evaluate(f'''(() => {{
 const element = document.querySelector({json.dumps(selector)});
 if (!element) throw new Error("browser selector did not match an element");
 return element.innerText ?? element.textContent ?? "";
-}})()"""
-        value = await self.evaluate(expression)
+}})()''')
         if not isinstance(value, str):
             raise BrowserProtocolError("page text evaluation did not return a string")
         return value
 
     async def fill(self, selector: str, value: str) -> str:
-        """Replace an input value, dispatch input/change events, and return the previous value."""
+        """Replace an input value, dispatch events, and return its previous value."""
         _validate_selector(selector)
         if not isinstance(value, str):
             raise TypeError("fill value must be a string")
-        expression = f"""(() => {{
+        previous = await self.evaluate(f'''(() => {{
 const element = document.querySelector({json.dumps(selector)});
 if (!element || !("value" in element)) throw new Error("browser selector did not match a fillable element");
 const previous = String(element.value);
-element.focus();
-element.value = {json.dumps(value)};
+element.focus(); element.value = {json.dumps(value)};
 element.dispatchEvent(new Event("input", {{ bubbles: true }}));
 element.dispatchEvent(new Event("change", {{ bubbles: true }}));
 return previous;
-}})()"""
-        previous = await self.evaluate(expression)
+}})()''')
         if not isinstance(previous, str):
             raise BrowserProtocolError("page fill evaluation did not return the previous value")
         return previous
@@ -333,22 +588,20 @@ return previous;
     async def click(self, selector: str) -> None:
         """Click one matching element."""
         _validate_selector(selector)
-        expression = f"""(() => {{
+        confirmed = await self.evaluate(f'''(() => {{
 const element = document.querySelector({json.dumps(selector)});
 if (!element || typeof element.click !== "function") throw new Error("browser selector did not match a clickable element");
-element.click();
-return true;
-}})()"""
-        if await self.evaluate(expression) is not True:
+element.click(); return true;
+}})()''')
+        if confirmed is not True:
             raise BrowserProtocolError("page click evaluation did not confirm the action")
 
     async def navigate(self, url: str) -> dict[str, Any]:
         """Begin navigation to an HTTP(S) URL or about:blank."""
         _validate_navigation_url(url)
         result = await self._command("Page.navigate", {"url": url})
-        error_text = result.get("errorText")
-        if isinstance(error_text, str) and error_text:
-            raise BrowserProtocolError(f"Chrome could not navigate to {url!r}: {error_text}")
+        if isinstance(result.get("errorText"), str) and result["errorText"]:
+            raise BrowserProtocolError(f"Chrome could not navigate to {url!r}: {result['errorText']}")
         return result
 
     async def close(self) -> None:
@@ -357,26 +610,16 @@ return true;
             return
         self._closed = True
         self.browser._pages.discard(self)
-        socket = self._socket
-        self._socket = None
-        if socket is not None:
-            try:
-                await socket.close()
-            except (ConnectionClosed, OSError):
-                pass
+        socket, self._socket = self._socket, None
+        if socket:
+            await socket.close()
 
 
 async def connect(endpoint: str, *, timeout: float = 5.0) -> Browser:
-    """Connect to an explicit loopback Chrome CDP endpoint.
-
-    The caller owns Chrome setup and lifecycle. Closing the returned object
-    closes only skill-owned HTTP and WebSocket connections.
-    """
+    """Connect to an explicit loopback Chrome CDP endpoint without owning Chrome."""
     if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
         raise ValueError("timeout must be a positive number")
-    normalized = _endpoint_url(endpoint)
-    client = httpx.AsyncClient(base_url=normalized, timeout=float(timeout), trust_env=False)
-    browser = Browser(normalized, client)
+    browser = Browser(_endpoint_url(endpoint), float(timeout))
     try:
         await browser.targets()
     except BaseException:
@@ -394,19 +637,8 @@ def _validate_navigation_url(url: str) -> None:
     if not isinstance(url, str) or not url:
         raise ValueError("navigation URL must be a non-empty string")
     parsed = urlsplit(url)
-    if url == "about:blank":
-        return
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+    if url != "about:blank" and (parsed.scheme not in ("http", "https") or not parsed.hostname):
         raise ValueError("navigation URL must use http, https, or about:blank")
 
 
-__all__ = [
-    "Browser",
-    "BrowserConnectionError",
-    "BrowserError",
-    "BrowserProtocolError",
-    "BrowserTargetError",
-    "Page",
-    "Target",
-    "connect",
-]
+__all__ = ["Browser", "BrowserConnectionError", "BrowserError", "BrowserProtocolError", "BrowserTargetError", "Page", "Target", "connect"]
