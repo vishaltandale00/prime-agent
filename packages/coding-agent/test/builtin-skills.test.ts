@@ -254,6 +254,15 @@ describe("builtin skills", () => {
 			expect(rlmHeartbeat?.kind === "python" && rlmHeartbeat.python.importName).toBe("rlm_heartbeat");
 		});
 
+		it("loads the bundled browser skill as a python skill", () => {
+			const { skills } = loadSkillsFromDir({ dir: getBundledSkillsDir(), source: "builtin" });
+
+			const browser = skills.find((s) => s.name === "browser");
+			expect(browser).toBeDefined();
+			expect(browser?.kind).toBe("python");
+			expect(browser?.kind === "python" && browser.python.importName).toBe("browser");
+		});
+
 		it("does not ship orchestration heartbeat as a built-in skill", () => {
 			const { skills } = loadSkillsFromDir({ dir: getBundledSkillsDir(), source: "builtin" });
 

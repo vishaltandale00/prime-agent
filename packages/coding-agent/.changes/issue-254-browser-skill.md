@@ -1,0 +1,1 @@
+- Added an in-process browser skill for attaching to an explicitly configured existing Chrome CDP endpoint.
