@@ -11,7 +11,7 @@ import struct
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 _MAX_HEADERS = 64 * 1024
 _MAX_BODY = 8 * 1024 * 1024
@@ -660,9 +660,13 @@ return dispatched;
                             and params.get("loaderId") == loader_id,
                         )
                     else:
+                        normalized_url = _normalized_navigation_url(url)
                         await self._event_unlocked(
                             "Page.navigatedWithinDocument",
-                            lambda params: isinstance(params, dict) and params.get("frameId") == frame_id,
+                            lambda params: isinstance(params, dict)
+                            and params.get("frameId") == frame_id
+                            and isinstance(params.get("url"), str)
+                            and _normalized_navigation_url(params["url"]) == normalized_url,
                         )
                     return result
             except asyncio.CancelledError:
@@ -714,8 +718,29 @@ def _validate_navigation_url(url: str) -> None:
     if not isinstance(url, str) or not url:
         raise ValueError("navigation URL must be a non-empty string")
     parsed = urlsplit(url)
-    if url != "about:blank" and (parsed.scheme not in ("http", "https") or not parsed.hostname):
+    if url != "about:blank" and (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or _normalized_navigation_url(url) is None
+    ):
         raise ValueError("navigation URL must use http, https, or about:blank")
+
+
+def _normalized_navigation_url(url: str) -> str | None:
+    if url == "about:blank":
+        return url
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except (AttributeError, ValueError):
+        return None
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https") or not parsed.hostname:
+        return None
+    netloc = parsed.netloc.lower()
+    if port == (443 if scheme == "https" else 80):
+        netloc = netloc.rsplit(":", 1)[0]
+    return urlunsplit((scheme, netloc, parsed.path or "/", parsed.query, parsed.fragment))
 
 
 __all__ = ["Browser", "BrowserConnectionError", "BrowserError", "BrowserProtocolError", "BrowserTargetError", "Page", "Target", "connect"]

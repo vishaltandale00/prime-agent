@@ -60,6 +60,7 @@ class FakeChromeCdp {
 	disabledClick = false;
 	stallNavigationCompletion = false;
 	sameDocumentNavigation = false;
+	sameDocumentEarlyUrl: string | undefined;
 	navigationRequests = 0;
 	readonly evaluatedExpressions: string[] = [];
 	private pendingNavigation: { socket: WebSocket; frameId: string; loaderId?: string } | undefined;
@@ -134,7 +135,14 @@ class FakeChromeCdp {
 						}),
 					);
 					this.pendingNavigation = { socket, frameId, loaderId };
-					if (this.sameDocumentNavigation) this.completeNavigation();
+					if (this.sameDocumentNavigation && this.sameDocumentEarlyUrl) {
+						socket.send(
+							JSON.stringify({
+								method: "Page.navigatedWithinDocument",
+								params: { frameId, url: this.sameDocumentEarlyUrl },
+							}),
+						);
+					} else if (this.sameDocumentNavigation) this.completeNavigation();
 					socket.send(JSON.stringify({ id: request.id, result: { frameId, ...(loaderId ? { loaderId } : {}) } }));
 					if (!this.sameDocumentNavigation && !this.stallNavigationCompletion)
 						queueMicrotask(() => this.completeNavigation());
@@ -407,6 +415,28 @@ async with await browser.connect("http://127.0.0.1:${chrome.port}") as chrome:
 
 		expect(result.status).toBe("ok");
 		expect(result.stdout).toContain("frame-1 existing marker");
+	});
+
+	it("ignores a same-frame same-document event for another URL and accepts normalized completion", async () => {
+		chrome.sameDocumentNavigation = true;
+		chrome.sameDocumentEarlyUrl = "https://example.test/other#wrong";
+		const manager = await provisioner!.ensure();
+		const execution = manager.execute(`
+async with await browser.connect("http://127.0.0.1:${chrome.port}") as chrome:
+    async with await chrome.page(target_id="page-existing") as page:
+        navigation = await page.navigate("https://EXAMPLE.test:443/existing#next")
+        print(navigation["frameId"], await page.read_text("#marker"))
+`);
+
+		await expect.poll(() => chrome.navigationRequests).toBe(1);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(chrome.evaluatedExpressions.some((expression) => expression.includes("innerText"))).toBe(false);
+		chrome.completeNavigation();
+
+		const result = await execution;
+		expect(result.status).toBe("ok");
+		expect(result.stdout).toContain("frame-1 existing marker");
+		expect(chrome.evaluatedExpressions.some((expression) => expression.includes("innerText"))).toBe(true);
 	});
 
 	it("rejects non-loopback endpoints and reports target and protocol failures honestly", async () => {
