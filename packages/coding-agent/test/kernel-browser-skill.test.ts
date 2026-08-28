@@ -23,6 +23,7 @@ class DomHTMLElement {
 	disabled = false;
 	clickCount = 0;
 	readonly listeners = new Set<() => void>();
+	constructor(private readonly onClick?: () => void) {}
 
 	matches(selector: string): boolean {
 		return selector === ":disabled" && this.disabled;
@@ -44,6 +45,40 @@ class DomHTMLElement {
 		if (this.disabled) return;
 		this.clickCount += 1;
 		for (const listener of [...this.listeners]) listener();
+		this.onClick?.();
+	}
+}
+
+class DomEvent {
+	constructor(
+		readonly type: string,
+		readonly options: { bubbles?: boolean } = {},
+	) {}
+}
+
+class DomInputElement {
+	private storedValue: string;
+	constructor(
+		value: string,
+		private readonly sanitizeAsNumber: boolean,
+		private readonly onChange?: () => void,
+	) {
+		this.storedValue = value;
+	}
+
+	get value(): string {
+		return this.storedValue;
+	}
+
+	set value(value: string) {
+		this.storedValue = this.sanitizeAsNumber && value !== "" && !Number.isFinite(Number(value)) ? "" : value;
+	}
+
+	focus(): void {}
+
+	dispatchEvent(event: DomEvent): boolean {
+		if (event.type === "input" || event.type === "change") this.onChange?.();
+		return true;
 	}
 }
 
@@ -58,6 +93,10 @@ class FakeChromeCdp {
 	closeCount = 0;
 	newPageRequests = 0;
 	disabledClick = false;
+	numberFillSanitizer = false;
+	fillTriggersNavigation = false;
+	clickTriggersNavigation = false;
+	navigationTriggered = false;
 	stallNavigationCompletion = false;
 	sameDocumentNavigation = false;
 	sameDocumentEarlyUrl: string | undefined;
@@ -203,15 +242,20 @@ class FakeChromeCdp {
 				this.evaluatedExpressions.push(expression);
 				let value: unknown = true;
 				if (expression.includes("innerText")) value = "existing marker";
-				if (expression.includes("const previous")) {
-					const previous = this.inputValue;
-					const match = expression.match(/element\.value = ("(?:[^"\\]|\\.)*");/);
-					if (!match) throw new Error("fill expression did not contain a JSON string value");
-					this.inputValue = JSON.parse(match[1]!) as string;
-					value = previous;
+				if (expression.includes("fillable element")) {
+					const element = new DomInputElement(this.inputValue, this.numberFillSanitizer, () => {
+						if (this.fillTriggersNavigation) this.navigationTriggered = true;
+					});
+					value = runInNewContext(expression, {
+						document: { querySelector: () => element },
+						Event: DomEvent,
+					});
+					this.inputValue = element.value;
 				}
 				if (expression.includes("enabled clickable element")) {
-					const element = new DomHTMLElement();
+					const element = new DomHTMLElement(() => {
+						if (this.clickTriggersNavigation) this.navigationTriggered = true;
+					});
 					element.disabled = this.disabledClick;
 					try {
 						value = runInNewContext(expression, {
@@ -322,8 +366,14 @@ async with await browser.connect(endpoint) as chrome:
     async with await chrome.page(title_contains="Existing") as page:
         observed = await page.read_text("#marker")
         previous = await page.fill("#name", "after")
+        first_action_terminal = page.closed
+    async with await chrome.page(title_contains="Existing") as page:
         restored_from = await page.fill("#name", previous)
+        second_action_terminal = page.closed
+    async with await chrome.page(title_contains="Existing") as page:
         await page.click("#action")
+        third_action_terminal = page.closed
+    async with await chrome.page(title_contains="Existing") as page:
         navigation = await page.navigate("https://example.test/next")
         page_closed_inside = page.closed
     page_closed_after = page.closed
@@ -334,6 +384,9 @@ print(json.dumps({
     "observed": observed,
     "previous": previous,
     "restored_from": restored_from,
+    "first_action_terminal": first_action_terminal,
+    "second_action_terminal": second_action_terminal,
+    "third_action_terminal": third_action_terminal,
     "navigation": navigation,
     "page_closed_inside": page_closed_inside,
     "page_closed_after": page_closed_after,
@@ -347,6 +400,9 @@ print(json.dumps({
 			observed: "existing marker",
 			previous: "before",
 			restored_from: "after",
+			first_action_terminal: true,
+			second_action_terminal: true,
+			third_action_terminal: true,
 			navigation: { frameId: "frame-1" },
 			page_closed_inside: false,
 			page_closed_after: true,
@@ -359,7 +415,74 @@ print(json.dumps({
 		});
 		expect(chrome.inputValue).toBe("before");
 		expect(chrome.clickCount).toBe(1);
-		expect(chrome.connectionCount).toBe(1);
+		expect(chrome.connectionCount).toBe(4);
+		await expect.poll(() => chrome.closeCount).toBe(4);
+	});
+
+	it("fails a sanitized number fill and closes before any later page operation", async () => {
+		chrome.numberFillSanitizer = true;
+		const manager = await provisioner!.ensure();
+		const result = await manager.execute(`
+async with await browser.connect("http://127.0.0.1:${chrome.port}") as chrome:
+    async with await chrome.page(target_id="page-existing") as page:
+        try:
+            await page.fill("input[type=number]", "not-a-number")
+        except Exception as error:
+            print(type(error).__name__, str(error))
+        try:
+            await page.read_text("#marker")
+        except Exception as error:
+            print(type(error).__name__, str(error))
+`);
+
+		expect(result.status).toBe("ok");
+		expect(result.stdout).toContain("BrowserProtocolError page rejected or sanitized the requested fill value");
+		expect(result.stdout).toContain("BrowserConnectionError Chrome page disconnected during Runtime.evaluate");
+		expect(chrome.inputValue).toBe("");
+		expect(chrome.evaluatedExpressions.some((expression) => expression.includes("innerText"))).toBe(false);
+		await expect.poll(() => chrome.closeCount).toBe(1);
+	});
+
+	it("makes a navigation-triggering fill terminal before a later read", async () => {
+		chrome.fillTriggersNavigation = true;
+		const manager = await provisioner!.ensure();
+		const result = await manager.execute(`
+async with await browser.connect("http://127.0.0.1:${chrome.port}") as chrome:
+    async with await chrome.page(target_id="page-existing") as page:
+        print(await page.fill("#name", "after"), page.closed)
+        try:
+            await page.read_text("#marker")
+        except Exception as error:
+            print(type(error).__name__, str(error))
+`);
+
+		expect(result.status).toBe("ok");
+		expect(result.stdout).toContain("before True");
+		expect(result.stdout).toContain("BrowserConnectionError Chrome page disconnected during Runtime.evaluate");
+		expect(chrome.navigationTriggered).toBe(true);
+		expect(chrome.evaluatedExpressions.some((expression) => expression.includes("innerText"))).toBe(false);
+		await expect.poll(() => chrome.closeCount).toBe(1);
+	});
+
+	it("makes a navigation-triggering click terminal before a later read", async () => {
+		chrome.clickTriggersNavigation = true;
+		const manager = await provisioner!.ensure();
+		const result = await manager.execute(`
+async with await browser.connect("http://127.0.0.1:${chrome.port}") as chrome:
+    async with await chrome.page(target_id="page-existing") as page:
+        await page.click("#link")
+        print(page.closed)
+        try:
+            await page.read_text("#marker")
+        except Exception as error:
+            print(type(error).__name__, str(error))
+`);
+
+		expect(result.status).toBe("ok");
+		expect(result.stdout).toContain("True");
+		expect(result.stdout).toContain("BrowserConnectionError Chrome page disconnected during Runtime.evaluate");
+		expect(chrome.navigationTriggered).toBe(true);
+		expect(chrome.evaluatedExpressions.some((expression) => expression.includes("innerText"))).toBe(false);
 		await expect.poll(() => chrome.closeCount).toBe(1);
 	});
 

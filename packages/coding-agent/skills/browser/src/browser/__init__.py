@@ -598,27 +598,37 @@ return element.innerText ?? element.textContent ?? "";
         return value
 
     async def fill(self, selector: str, value: str) -> str:
-        """Replace an input value, dispatch events, and return its previous value."""
+        """Replace and verify an input value, then disconnect this terminal page action."""
         _validate_selector(selector)
         if not isinstance(value, str):
             raise TypeError("fill value must be a string")
-        previous = await self.evaluate(f'''(() => {{
+        try:
+            result = await self.evaluate(f'''(() => {{
 const element = document.querySelector({json.dumps(selector)});
 if (!element || !("value" in element)) throw new Error("browser selector did not match a fillable element");
 const previous = String(element.value);
 element.focus(); element.value = {json.dumps(value)};
 element.dispatchEvent(new Event("input", {{ bubbles: true }}));
 element.dispatchEvent(new Event("change", {{ bubbles: true }}));
-return previous;
+return {{ previous, current: String(element.value) }};
 }})()''')
-        if not isinstance(previous, str):
-            raise BrowserProtocolError("page fill evaluation did not return the previous value")
-        return previous
+            if not isinstance(result, dict):
+                raise BrowserProtocolError("page fill evaluation did not return its value receipt")
+            previous = result.get("previous")
+            current = result.get("current")
+            if not isinstance(previous, str) or not isinstance(current, str):
+                raise BrowserProtocolError("page fill evaluation returned an invalid value receipt")
+            if current != value:
+                raise BrowserProtocolError("page rejected or sanitized the requested fill value")
+            return previous
+        finally:
+            await asyncio.shield(self.close())
 
     async def click(self, selector: str) -> None:
-        """Click one matching element."""
+        """Click one matching element, then disconnect this terminal page action."""
         _validate_selector(selector)
-        confirmed = await self.evaluate(f'''(() => {{
+        try:
+            confirmed = await self.evaluate(f'''(() => {{
 const element = document.querySelector({json.dumps(selector)});
 if (!(element instanceof HTMLElement) || element.matches(":disabled") || element.getAttribute("aria-disabled") === "true") {{
     throw new Error("browser selector did not match an enabled clickable element");
@@ -629,8 +639,10 @@ element.addEventListener("click", observe, {{ capture: true }});
 try {{ HTMLElement.prototype.click.call(element); }} finally {{ element.removeEventListener("click", observe, {{ capture: true }}); }}
 return dispatched;
 }})()''')
-        if confirmed is not True:
-            raise BrowserProtocolError("page click evaluation did not confirm the action")
+            if confirmed is not True:
+                raise BrowserProtocolError("page click evaluation did not confirm the action")
+        finally:
+            await asyncio.shield(self.close())
 
     async def navigate(self, url: str) -> dict[str, Any]:
         """Navigate and wait for correlated main-frame completion."""

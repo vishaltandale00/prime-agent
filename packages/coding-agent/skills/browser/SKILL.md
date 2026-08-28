@@ -44,15 +44,20 @@ async with await browser.connect("http://127.0.0.1:9222") as chrome:
     async with await chrome.page(title_contains="Settings") as page:
         previous = await page.fill("#display-name", "New name")
         print(previous)
+    # Fill is terminal: reacquire the target after any resulting page transition settles.
+    async with await chrome.page(title_contains="Settings") as page:
         await page.click("button[type=submit]")
 ```
 
 Use `page.evaluate(...)` only when the narrower `read_text`, `fill`, `click`,
 or `navigate` methods are insufficient. One approved cell may contain several
-browser operations. `page.navigate(...)` waits for the exact main-frame load,
-or the correlated same-document event, before later operations continue. Never
-claim a page was read or changed when attachment, target selection, navigation,
-or evaluation failed.
+browser operations, but `fill` and `click` are terminal page actions: they close
+only their CDP page connection after verifying the synchronous DOM action.
+Reacquire the target before a later operation so a form submission or event-
+triggered navigation cannot expose the outgoing document. `page.navigate(...)`
+waits for the exact main-frame load, or the correlated same-document event,
+before later operations continue. Never claim a page was read or changed when
+attachment, target selection, navigation, or evaluation failed.
 
 ## Lifecycle and limitations
 
