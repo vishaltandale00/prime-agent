@@ -49,8 +49,10 @@ async with await browser.connect("http://127.0.0.1:9222") as chrome:
 
 Use `page.evaluate(...)` only when the narrower `read_text`, `fill`, `click`,
 or `navigate` methods are insufficient. One approved cell may contain several
-browser operations. Never claim a page was read or changed when attachment,
-target selection, navigation, or evaluation failed.
+browser operations. `page.navigate(...)` waits for the exact main-frame load,
+or the correlated same-document event, before later operations continue. Never
+claim a page was read or changed when attachment, target selection, navigation,
+or evaluation failed.
 
 ## Lifecycle and limitations
 

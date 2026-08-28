@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import struct
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from typing import Any
 from urllib.parse import quote, urlsplit
@@ -16,6 +17,7 @@ _MAX_HEADERS = 64 * 1024
 _MAX_BODY = 8 * 1024 * 1024
 _MAX_FRAME = 8 * 1024 * 1024
 _MAX_MESSAGE = 8 * 1024 * 1024
+_MAX_EVENTS = 64
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
@@ -458,6 +460,7 @@ class Page:
         self._socket: _WebSocket | None = None
         self._command_lock = asyncio.Lock()
         self._next_command_id = 1
+        self._events: list[dict[str, Any]] = []
         self._closed = False
 
     async def __aenter__(self) -> Page:
@@ -500,29 +503,56 @@ class Page:
             await self.close()
             raise BrowserConnectionError(f"could not attach to Chrome page {self.target.target_id!r}") from error
 
-    async def _command(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _remember_event(self, message: dict[str, Any]) -> None:
+        if not isinstance(message.get("method"), str):
+            return
+        self._events.append(message)
+        if len(self._events) > _MAX_EVENTS:
+            del self._events[: len(self._events) - _MAX_EVENTS]
+
+    async def _command_unlocked(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         if self._closed or self._socket is None:
             raise BrowserConnectionError("page connection is closed")
+        command_id = self._next_command_id
+        self._next_command_id += 1
+        await self._socket.send_text(json.dumps({"id": command_id, "method": method, "params": params or {}}))
+        while True:
+            message = json.loads(await self._socket.receive_text())
+            if not isinstance(message, dict):
+                continue
+            if message.get("id") != command_id:
+                self._remember_event(message)
+                continue
+            error = message.get("error")
+            if isinstance(error, dict):
+                detail = error.get("message")
+                raise BrowserProtocolError(
+                    f"Chrome CDP command {method} failed: {detail if isinstance(detail, str) else 'unknown error'}"
+                )
+            result = message.get("result")
+            if not isinstance(result, dict):
+                raise BrowserProtocolError(f"Chrome CDP command {method} returned no result")
+            return result
+
+    async def _event_unlocked(self, method: str, matches: Callable[[Any], bool]) -> dict[str, Any]:
+        for index, message in enumerate(self._events):
+            if message.get("method") == method and matches(message.get("params")):
+                return self._events.pop(index)
+        if self._socket is None:
+            raise BrowserConnectionError("page connection is closed")
+        while True:
+            message = json.loads(await self._socket.receive_text())
+            if not isinstance(message, dict):
+                continue
+            if message.get("method") == method and matches(message.get("params")):
+                return message
+            self._remember_event(message)
+
+    async def _command(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         async with self._command_lock:
-            command_id = self._next_command_id
-            self._next_command_id += 1
             try:
                 async with asyncio.timeout(self.browser._timeout):
-                    await self._socket.send_text(json.dumps({"id": command_id, "method": method, "params": params or {}}))
-                    while True:
-                        message = json.loads(await self._socket.receive_text())
-                        if not isinstance(message, dict) or message.get("id") != command_id:
-                            continue
-                        error = message.get("error")
-                        if isinstance(error, dict):
-                            detail = error.get("message")
-                            raise BrowserProtocolError(
-                                f"Chrome CDP command {method} failed: {detail if isinstance(detail, str) else 'unknown error'}"
-                            )
-                        result = message.get("result")
-                        if not isinstance(result, dict):
-                            raise BrowserProtocolError(f"Chrome CDP command {method} returned no result")
-                        return result
+                    return await self._command_unlocked(method, params)
             except asyncio.CancelledError:
                 await asyncio.shield(self.close())
                 raise
@@ -590,19 +620,66 @@ return previous;
         _validate_selector(selector)
         confirmed = await self.evaluate(f'''(() => {{
 const element = document.querySelector({json.dumps(selector)});
-if (!element || typeof element.click !== "function") throw new Error("browser selector did not match a clickable element");
-element.click(); return true;
+if (!(element instanceof HTMLElement) || element.matches(":disabled") || element.getAttribute("aria-disabled") === "true") {{
+    throw new Error("browser selector did not match an enabled clickable element");
+}}
+let dispatched = false;
+const observe = () => {{ dispatched = true; }};
+element.addEventListener("click", observe, {{ capture: true }});
+try {{ HTMLElement.prototype.click.call(element); }} finally {{ element.removeEventListener("click", observe, {{ capture: true }}); }}
+return dispatched;
 }})()''')
         if confirmed is not True:
             raise BrowserProtocolError("page click evaluation did not confirm the action")
 
     async def navigate(self, url: str) -> dict[str, Any]:
-        """Begin navigation to an HTTP(S) URL or about:blank."""
+        """Navigate and wait for correlated main-frame completion."""
         _validate_navigation_url(url)
-        result = await self._command("Page.navigate", {"url": url})
-        if isinstance(result.get("errorText"), str) and result["errorText"]:
-            raise BrowserProtocolError(f"Chrome could not navigate to {url!r}: {result['errorText']}")
-        return result
+        async with self._command_lock:
+            try:
+                async with asyncio.timeout(self.browser._timeout):
+                    await self._command_unlocked("Page.enable")
+                    await self._command_unlocked("Page.setLifecycleEventsEnabled", {"enabled": True})
+                    self._events = [
+                        event for event in self._events
+                        if event.get("method") not in {"Page.lifecycleEvent", "Page.navigatedWithinDocument"}
+                    ]
+                    result = await self._command_unlocked("Page.navigate", {"url": url})
+                    if isinstance(result.get("errorText"), str) and result["errorText"]:
+                        raise BrowserProtocolError(f"Chrome could not navigate to {url!r}: {result['errorText']}")
+                    frame_id = result.get("frameId")
+                    if not isinstance(frame_id, str) or not frame_id:
+                        raise BrowserProtocolError("Chrome navigation returned no frame identity")
+                    loader_id = result.get("loaderId")
+                    if isinstance(loader_id, str) and loader_id:
+                        await self._event_unlocked(
+                            "Page.lifecycleEvent",
+                            lambda params: isinstance(params, dict)
+                            and params.get("name") == "load"
+                            and params.get("frameId") == frame_id
+                            and params.get("loaderId") == loader_id,
+                        )
+                    else:
+                        await self._event_unlocked(
+                            "Page.navigatedWithinDocument",
+                            lambda params: isinstance(params, dict) and params.get("frameId") == frame_id,
+                        )
+                    return result
+            except asyncio.CancelledError:
+                await asyncio.shield(self.close())
+                raise
+            except BrowserProtocolError:
+                await self.close()
+                raise
+            except BrowserConnectionError as error:
+                await self.close()
+                raise BrowserConnectionError("Chrome page disconnected during Page.navigate") from error
+            except TimeoutError as error:
+                await self.close()
+                raise BrowserConnectionError("Chrome page disconnected during Page.navigate") from error
+            except (ValueError, TypeError) as error:
+                await self.close()
+                raise BrowserConnectionError("Chrome page disconnected during Page.navigate") from error
 
     async def close(self) -> None:
         """Close only this CDP WebSocket, never the target tab."""

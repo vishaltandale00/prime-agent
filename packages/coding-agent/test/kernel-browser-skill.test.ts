@@ -2,6 +2,7 @@ import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { runInNewContext } from "node:vm";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { type WebSocket, WebSocketServer } from "ws";
 import { getBundledSkillsDir } from "../src/config.js";
@@ -18,6 +19,34 @@ function bundledBrowserSkill(): PythonSkillRuntimeInfo {
 	};
 }
 
+class DomHTMLElement {
+	disabled = false;
+	clickCount = 0;
+	readonly listeners = new Set<() => void>();
+
+	matches(selector: string): boolean {
+		return selector === ":disabled" && this.disabled;
+	}
+
+	getAttribute(_name: string): string | null {
+		return null;
+	}
+
+	addEventListener(type: string, listener: () => void): void {
+		if (type === "click") this.listeners.add(listener);
+	}
+
+	removeEventListener(type: string, listener: () => void): void {
+		if (type === "click") this.listeners.delete(listener);
+	}
+
+	click(): void {
+		if (this.disabled) return;
+		this.clickCount += 1;
+		for (const listener of [...this.listeners]) listener();
+	}
+}
+
 class FakeChromeCdp {
 	readonly server: Server;
 	readonly sockets = new Set<WebSocket>();
@@ -28,6 +57,12 @@ class FakeChromeCdp {
 	connectionCount = 0;
 	closeCount = 0;
 	newPageRequests = 0;
+	disabledClick = false;
+	stallNavigationCompletion = false;
+	sameDocumentNavigation = false;
+	navigationRequests = 0;
+	readonly evaluatedExpressions: string[] = [];
+	private pendingNavigation: { socket: WebSocket; frameId: string; loaderId?: string } | undefined;
 
 	constructor() {
 		this.server = createServer((request, response) => {
@@ -84,6 +119,27 @@ class FakeChromeCdp {
 					params?: { expression?: string; url?: string };
 				};
 				const expression = request.params?.expression ?? "";
+				if (request.method === "Page.enable" || request.method === "Page.setLifecycleEventsEnabled") {
+					socket.send(JSON.stringify({ id: request.id, result: {} }));
+					return;
+				}
+				if (request.method === "Page.navigate") {
+					this.navigationRequests += 1;
+					const frameId = "frame-1";
+					const loaderId = this.sameDocumentNavigation ? undefined : "loader-new";
+					socket.send(
+						JSON.stringify({
+							method: "Page.lifecycleEvent",
+							params: { frameId, loaderId: "loader-old", name: "load" },
+						}),
+					);
+					this.pendingNavigation = { socket, frameId, loaderId };
+					if (this.sameDocumentNavigation) this.completeNavigation();
+					socket.send(JSON.stringify({ id: request.id, result: { frameId, ...(loaderId ? { loaderId } : {}) } }));
+					if (!this.sameDocumentNavigation && !this.stallNavigationCompletion)
+						queueMicrotask(() => this.completeNavigation());
+					return;
+				}
 				if (expression === "hold") return;
 				if (expression === "drip") {
 					const timer = setInterval(() => {
@@ -136,6 +192,7 @@ class FakeChromeCdp {
 					);
 					return;
 				}
+				this.evaluatedExpressions.push(expression);
 				let value: unknown = true;
 				if (expression.includes("innerText")) value = "existing marker";
 				if (expression.includes("const previous")) {
@@ -145,10 +202,27 @@ class FakeChromeCdp {
 					this.inputValue = JSON.parse(match[1]!) as string;
 					value = previous;
 				}
-				if (expression.includes("element.click()")) this.clickCount += 1;
-				if (request.method === "Page.navigate") {
-					socket.send(JSON.stringify({ id: request.id, result: { frameId: "frame-1" } }));
-					return;
+				if (expression.includes("enabled clickable element")) {
+					const element = new DomHTMLElement();
+					element.disabled = this.disabledClick;
+					try {
+						value = runInNewContext(expression, {
+							document: { querySelector: () => element },
+							HTMLElement: DomHTMLElement,
+						});
+						this.clickCount += element.clickCount;
+					} catch {
+						socket.send(
+							JSON.stringify({
+								id: request.id,
+								result: {
+									exceptionDetails: { text: "fixture click exception" },
+									result: { type: "undefined" },
+								},
+							}),
+						);
+						return;
+					}
 				}
 				socket.send(
 					JSON.stringify({
@@ -158,6 +232,27 @@ class FakeChromeCdp {
 				);
 			});
 		});
+	}
+
+	completeNavigation(): void {
+		const pending = this.pendingNavigation;
+		if (!pending || pending.socket.readyState !== pending.socket.OPEN) return;
+		this.pendingNavigation = undefined;
+		if (pending.loaderId) {
+			pending.socket.send(
+				JSON.stringify({
+					method: "Page.lifecycleEvent",
+					params: { frameId: pending.frameId, loaderId: pending.loaderId, name: "load" },
+				}),
+			);
+			return;
+		}
+		pending.socket.send(
+			JSON.stringify({
+				method: "Page.navigatedWithinDocument",
+				params: { frameId: pending.frameId, url: "https://example.test/existing#next" },
+			}),
+		);
 	}
 
 	async start(): Promise<void> {
@@ -258,6 +353,60 @@ print(json.dumps({
 		expect(chrome.clickCount).toBe(1);
 		expect(chrome.connectionCount).toBe(1);
 		await expect.poll(() => chrome.closeCount).toBe(1);
+	});
+
+	it("rejects a disabled click through the production page expression", async () => {
+		chrome.disabledClick = true;
+		const manager = await provisioner!.ensure();
+		const result = await manager.execute(`
+async with await browser.connect("http://127.0.0.1:${chrome.port}") as chrome:
+    async with await chrome.page(target_id="page-existing") as page:
+        try:
+            await page.click("#disabled")
+        except Exception as error:
+            print(type(error).__name__, str(error))
+`);
+
+		expect(result.status).toBe("ok");
+		expect(result.stdout).toContain("BrowserProtocolError page evaluation failed: fixture click exception");
+		expect(chrome.clickCount).toBe(0);
+		await expect.poll(() => chrome.closeCount).toBe(1);
+	});
+
+	it("waits for the exact navigation loader before allowing a later read", async () => {
+		chrome.stallNavigationCompletion = true;
+		const manager = await provisioner!.ensure();
+		const execution = manager.execute(`
+async with await browser.connect("http://127.0.0.1:${chrome.port}") as chrome:
+    async with await chrome.page(target_id="page-existing") as page:
+        navigation = await page.navigate("https://example.test/next")
+        observed = await page.read_text("#marker")
+        print(navigation["loaderId"], observed)
+`);
+
+		await expect.poll(() => chrome.navigationRequests).toBe(1);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(chrome.evaluatedExpressions.some((expression) => expression.includes("innerText"))).toBe(false);
+		chrome.completeNavigation();
+
+		const result = await execution;
+		expect(result.status).toBe("ok");
+		expect(result.stdout).toContain("loader-new existing marker");
+		expect(chrome.evaluatedExpressions.some((expression) => expression.includes("innerText"))).toBe(true);
+	});
+
+	it("accepts a same-document navigation event buffered before the command response", async () => {
+		chrome.sameDocumentNavigation = true;
+		const manager = await provisioner!.ensure();
+		const result = await manager.execute(`
+async with await browser.connect("http://127.0.0.1:${chrome.port}") as chrome:
+    async with await chrome.page(target_id="page-existing") as page:
+        navigation = await page.navigate("https://example.test/existing#next")
+        print(navigation["frameId"], await page.read_text("#marker"))
+`);
+
+		expect(result.status).toBe("ok");
+		expect(result.stdout).toContain("frame-1 existing marker");
 	});
 
 	it("rejects non-loopback endpoints and reports target and protocol failures honestly", async () => {
